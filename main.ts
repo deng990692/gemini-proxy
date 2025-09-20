@@ -50,22 +50,46 @@ serve(async (req) => {
 
         const ai = new GoogleGenAI({ apiKey });
 
-        // --- 流式请求的正确处理方式 ---
         if (isStreaming) {
             console.log("🚀 Handling STREAMING request...");
             
-            // 1. 从 Google API 获取流
             const streamResult = await ai.models.generateContentStream({
                 model: modelName,
                 ...geminiRequest,
             });
 
-            // 2. 直接将获取到的流作为响应体返回，不做任何处理！
-            console.log("✅ Got stream from Google. Piping it directly to the client.");
-            return new Response(streamResult.stream, {
+            // --- 正确的流转换逻辑 ---
+            // 创建一个我们自己控制的新流
+            const responseStream = new ReadableStream({
+                async start(controller) {
+                    console.log("✅ Starting to process and forward stream chunks in SSE format...");
+                    // 遍历从 Google 获取的原始流
+                    for await (const chunk of streamResult.stream) {
+                        // 将每个 JSON chunk 转换为字符串
+                        const chunkString = JSON.stringify(chunk);
+                        
+                        // *** The Crucial Step ***
+                        // 包装成 SSE 格式
+                        const sseFormattedChunk = `data: ${chunkString}\n\n`;
+                        
+                        // [新增日志] 打印我们到底发送了什么
+                        // console.log(`[DEBUG] Sending chunk: ${sseFormattedChunk}`);
+                        
+                        // 将格式化后的字符串编码并推入我们的新流中
+                        controller.enqueue(new TextEncoder().encode(sseFormattedChunk));
+                    }
+                    console.log("🏁 Stream from Google finished. Closing connection to client.");
+                    // 关闭我们的流
+                    controller.close();
+                }
+            });
+
+            // 返回我们自己创建的、格式正确的流
+            return new Response(responseStream, {
                 headers: {
-                    // Gemini API流的Content-Type是application/json
-                    "Content-Type": "application/json", 
+                    // *** The Crucial Header ***
+                    // 明确告诉客户端这是一个 SSE 流
+                    "Content-Type": "text/event-stream", 
                     "Access-Control-Allow-Origin": "*",
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
@@ -73,7 +97,7 @@ serve(async (req) => {
             });
         }
 
-        // --- 非流式请求（保持不变）---
+        // 非流式请求（保持不变）
         if (isUnary) {
             console.log("⚡ Handling NON-STREAMING (unary) request...");
             const result = await ai.models.generateContent({
