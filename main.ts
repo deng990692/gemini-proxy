@@ -15,8 +15,6 @@ function createJsonErrorResponse(message: string, statusCode = 500, statusText =
 // 主服务逻辑
 serve(async (req) => {
     const pathname = new URL(req.url).pathname;
-    console.log(`\n--- New Request Received ---`);
-    console.log(`[DEBUG] Request Method: ${req.method}, Full Pathname: ${pathname}`);
 
     if (req.method === 'OPTIONS') {
         return new Response(null, { status: 204, headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "POST, GET, OPTIONS", "Access-Control-Allow-Headers": "Content-Type, Authorization, x-goog-api-key" } });
@@ -26,7 +24,6 @@ serve(async (req) => {
     const isUnary = pathname.includes(":generateContent");
 
     if (req.method !== 'POST' || (!isStreaming && !isUnary)) {
-        console.log(`[INFO] Ignoring non-POST or non-generate request to path: ${pathname}`);
         return createJsonErrorResponse(`Endpoint not found.`, 404, "NOT_FOUND");
     }
 
@@ -53,56 +50,42 @@ serve(async (req) => {
 
         const ai = new GoogleGenAI({ apiKey });
 
+        // --- 流式请求的正确处理方式 ---
         if (isStreaming) {
             console.log("🚀 Handling STREAMING request...");
             
-            // --- 新增：在这里添加详细的日志和错误捕获 ---
-            try {
-                console.log("[DEBUG] Attempting to call Google API for streaming...");
-                const streamResult = await ai.models.generateContentStream({
-                    model: modelName,
-                    ...geminiRequest,
-                });
-                console.log("[DEBUG] Successfully received stream response from Google API. Starting to process chunks...");
+            // 1. 从 Google API 获取流
+            const streamResult = await ai.models.generateContentStream({
+                model: modelName,
+                ...geminiRequest,
+            });
 
-                const responseStream = new ReadableStream({
-                    async start(controller) {
-                        for await (const chunk of streamResult.stream) {
-                            const chunkString = `data: ${JSON.stringify(chunk)}\n\n`;
-                            controller.enqueue(new TextEncoder().encode(chunkString));
-                        }
-                        console.log("✅ Stream finished.");
-                        controller.close();
-                    }
-                });
-                return new Response(responseStream, { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*", "Cache-Control": "no-cache", "Connection": "keep-alive" } });
-
-            } catch (e) {
-                console.error("[CRITICAL] Error occurred during the call to Google API (stream):", e);
-                return createJsonErrorResponse(`Failed to call Google API: ${e.message}`, 502, "BAD_GATEWAY");
-            }
+            // 2. 直接将获取到的流作为响应体返回，不做任何处理！
+            console.log("✅ Got stream from Google. Piping it directly to the client.");
+            return new Response(streamResult.stream, {
+                headers: {
+                    // Gemini API流的Content-Type是application/json
+                    "Content-Type": "application/json", 
+                    "Access-Control-Allow-Origin": "*",
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                },
+            });
         }
 
+        // --- 非流式请求（保持不变）---
         if (isUnary) {
             console.log("⚡ Handling NON-STREAMING (unary) request...");
-            // (为非流式也添加了类似的保护)
-             try {
-                console.log("[DEBUG] Attempting to call Google API for unary...");
-                const result = await ai.models.generateContent({
-                    model: modelName,
-                    ...geminiRequest,
-                });
-                console.log("[DEBUG] Successfully received unary response from Google API.");
-                const responsePayload = result.response;
-                return new Response(JSON.stringify(responsePayload), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
-            } catch (e) {
-                console.error("[CRITICAL] Error occurred during the call to Google API (unary):", e);
-                return createJsonErrorResponse(`Failed to call Google API: ${e.message}`, 502, "BAD_GATEWAY");
-            }
+            const result = await ai.models.generateContent({
+                model: modelName,
+                ...geminiRequest,
+            });
+            const responsePayload = result.response;
+            return new Response(JSON.stringify(responsePayload), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
         }
 
     } catch (error) {
-        console.error("Error in main handler:", error);
+        console.error("Error in handler:", error);
         return createJsonErrorResponse(error.message || "An unknown error occurred", 500);
     }
 });
