@@ -1,14 +1,13 @@
 import { serve } from "https://deno.land/std@0.200.0/http/server.ts";
-// 严格按照最新的 @google/genai 库规范进行导入
 import { GoogleGenAI } from "npm:@google/genai";
 
-// --- 辅助函数：生成与 Gemini API 格式一致的错误 JSON 响应 ---
-function createJsonErrorResponse(message: string, statusCode = 500) {
+// 辅助函数：生成错误响应
+function createJsonErrorResponse(message: string, statusCode = 500, statusText = "INTERNAL") {
     const errorPayload = {
         error: {
             code: statusCode,
             message: message,
-            status: "INTERNAL",
+            status: statusText,
         },
     };
     console.error("Replying with error:", JSON.stringify(errorPayload, null, 2));
@@ -21,11 +20,15 @@ function createJsonErrorResponse(message: string, statusCode = 500) {
     });
 }
 
-// --- 主服务逻辑 ---
+// 主服务逻辑
 serve(async (req) => {
     const pathname = new URL(req.url).pathname;
 
-    // --- CORS 预检请求处理 ---
+    // --- 新增：为每一次请求都打印详细日志 ---
+    console.log(`\n--- New Request Received ---`);
+    console.log(`[DEBUG] Request Method: ${req.method}, Full Pathname: ${pathname}`);
+
+    // CORS 预检请求处理
     if (req.method === 'OPTIONS') {
         return new Response(null, {
             status: 204,
@@ -36,17 +39,31 @@ serve(async (req) => {
             },
         });
     }
+    
+    // --- 改进：更精准的路由判断 ---
+    // 只处理包含 :generateContent 或 :streamGenerateContent 的POST请求
+    const isStreaming = pathname.includes(":streamGenerateContent");
+    const isUnary = pathname.includes(":generateContent");
 
-    // --- 动态模型名称提取 ---
-    const modelMatch = pathname.match(/models\/(.+?):(streamG|g)enerateContent/);
-    if (!modelMatch || !modelMatch[1]) {
-        return createJsonErrorResponse("Request path does not contain a valid model name.", 400);
+    if (req.method !== 'POST' || (!isStreaming && !isUnary)) {
+        console.log(`[INFO] Ignoring non-POST or non-generate request to path: ${pathname}`);
+        return createJsonErrorResponse(
+            `Endpoint not found. This proxy only handles POST requests to paths ending with ':generateContent' or ':streamGenerateContent'.`, 
+            404, 
+            "NOT_FOUND"
+        );
     }
-    const modelName = modelMatch[1];
-    console.log(`- Intercepted request for model: ${modelName}`);
 
-    // --- 统一的请求处理逻辑 ---
     try {
+        // 动态模型名称提取
+        const modelMatch = pathname.match(/models\/(.+?):/);
+        if (!modelMatch || !modelMatch[1]) {
+            // 这个错误现在只会在路径格式错误时触发，例如 "models/:generateContent"
+            return createJsonErrorResponse(`Could not extract model name from path: ${pathname}`, 400, "INVALID_ARGUMENT");
+        }
+        const modelName = modelMatch[1];
+        console.log(`- Intercepted request for model: ${modelName}`);
+
         const geminiRequest = await req.json();
 
         // 提取 API Key
@@ -57,24 +74,18 @@ serve(async (req) => {
         } else {
             apiKey = req.headers.get("x-goog-api-key") || "";
         }
-
         if (!apiKey) {
-            return createJsonErrorResponse("API key is missing from headers.", 401);
+            return createJsonErrorResponse("API key is missing from headers.", 401, "UNAUTHENTICATED");
         }
 
-        // --- 初始化 Google GenAI 客户端 (正确方式) ---
-        // 注意：新版库的构造函数接受一个包含 apiKey 的对象
         const ai = new GoogleGenAI({ apiKey });
 
-        // --- 路由 1: 流式请求 (:streamGenerateContent) ---
-        if (pathname.includes(":streamGenerateContent")) {
+        // 流式请求
+        if (isStreaming) {
             console.log("🚀 Handling STREAMING request...");
-            
-            // --- 调用 generateContentStream (正确方式) ---
-            // 将模型名称和请求内容一起传入
             const streamResult = await ai.models.generateContentStream({
                 model: modelName,
-                ...geminiRequest, // 将cherrystudio的请求体(contents等)直接展开传入
+                ...geminiRequest,
             });
             
             const responseStream = new ReadableStream({
@@ -98,20 +109,14 @@ serve(async (req) => {
             });
         }
 
-        // --- 路由 2: 非流式请求 (:generateContent) ---
-        if (pathname.includes(":generateContent")) {
+        // 非流式请求
+        if (isUnary) {
             console.log("⚡ Handling NON-STREAMING (unary) request...");
-
-            // --- 调用 generateContent (正确方式) ---
-            // 将模型名称和请求内容一起传入
             const result = await ai.models.generateContent({
                 model: modelName,
-                ...geminiRequest, // 将cherrystudio的请求体(contents等)直接展开传入
+                ...geminiRequest,
             });
-            
-            const responsePayload = result.response; 
-
-            console.log("✅ Sending final NON-STREAMED payload.");
+            const responsePayload = result.response;
             return new Response(JSON.stringify(responsePayload), {
                 headers: {
                     "Content-Type": "application/json",
@@ -119,8 +124,6 @@ serve(async (req) => {
                 },
             });
         }
-        
-        return createJsonErrorResponse("Endpoint not found.", 404);
 
     } catch (error) {
         console.error("Error in handler:", error);
