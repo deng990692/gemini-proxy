@@ -3,10 +3,6 @@ import { GoogleGenAI } from "npm:@google/genai";
 
 /**
  * 辅助函数：生成一个标准格式的 JSON 错误响应
- * @param message 错误信息
- * @param statusCode HTTP 状态码
- * @param statusText 错误状态文本
- * @returns 一个 Deno Response 对象
  */
 function createJsonErrorResponse(message: string, statusCode = 500, statusText = "INTERNAL") {
     const errorPayload = {
@@ -58,7 +54,6 @@ serve(async (req) => {
         const modelName = modelMatch[1];
         
         const geminiRequest = await req.json();
-        console.log("\n[INFO] Received request for model:", modelName);
         
         const authHeader = req.headers.get("Authorization");
         let apiKey = "";
@@ -77,42 +72,28 @@ serve(async (req) => {
         if (isStreaming) {
             console.log("🚀 Handling STREAMING request...");
             
-            const streamResult = await ai.models.generateContentStream({
+            // 严格按照最新规范调用 API
+            const responseIterable = await ai.models.generateContentStream({
                 model: modelName,
                 ...geminiRequest,
             });
 
-            // --- 诊断日志 和 安全检查 (最关键的部分) ---
-            console.log("\n==============================================");
-            console.log("---  DIAGNOSTIC LOG: Full 'streamResult' Object from Google ---");
-            try {
-                // 打印 Google API 返回的完整对象
-                console.log(JSON.stringify(streamResult, null, 2));
-            } catch (e) {
-                console.log("Could not stringify streamResult:", e);
-            }
-            console.log("----------------------------------------------------------\n");
-            
-            // 安全检查：如果 streamResult 或者 streamResult.stream 不存在，则不能继续
-            if (!streamResult || !streamResult.stream) {
-                console.error("[CRITICAL] 'streamResult.stream' is missing or the whole result is falsy. The API likely returned an error payload instead of a stream.");
-                return createJsonErrorResponse(
-                    "Failed to get a valid stream from Google API. Check the server logs for the full response from Google.", 
-                    502, // Bad Gateway,因为我们作为网关无法从上游（Google）获取正确响应
-                    "BAD_GATEWAY"
-                );
-            }
-
-            // 如果检查通过，我们才创建响应流
+            // 创建一个新的流，用于向客户端转发格式化后的数据
             const responseStream = new ReadableStream({
                 async start(controller) {
-                    console.log("✅ Safety check passed. Starting to forward stream chunks in SSE format...");
-                    for await (const chunk of streamResult.stream) {
-                        const sseFormattedChunk = `data: ${JSON.stringify(chunk)}\n\n`;
-                        controller.enqueue(new TextEncoder().encode(sseFormattedChunk));
+                    console.log("✅ Starting to process and forward stream chunks in SSE format...");
+                    try {
+                        // *** 核心修正：直接遍历 API 返回的对象，不再访问 .stream ***
+                        for await (const chunk of responseIterable) {
+                            const sseFormattedChunk = `data: ${JSON.stringify(chunk)}\n\n`;
+                            controller.enqueue(new TextEncoder().encode(sseFormattedChunk));
+                        }
+                        console.log(`🏁 Stream from Google finished. Closing connection to client.`);
+                        controller.close();
+                    } catch(e) {
+                         console.error("[CRITICAL] Error inside the stream processing loop:", e);
+                         controller.error(e);
                     }
-                    console.log(`🏁 Stream from Google finished. Closing connection to client.`);
-                    controller.close();
                 }
             });
 
