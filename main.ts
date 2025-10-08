@@ -65,6 +65,22 @@ async function handler(req: Request): Promise<Response> {
     });
   }
 
+  // === OPENAI 兼容开始 ===
+  // OpenAI 模型到 Gemini 模型的映射
+  const OPENAI_TO_GEMINI: Record<string, string> = {
+    "gpt-3.5-turbo": "gemini-pro",
+    "gpt-4": "gemini-1.5-pro",
+    "gemini-pro": "gemini-pro",
+    "gemini-1.5-pro": "gemini-1.5-pro",
+    "gemini-1.5-flash": "gemini-1.5-flash",
+  };
+  
+  // 生成 OpenAI 风格的响应 ID
+  function generateOpenAIId(): string {
+    return "chatcmpl-" + crypto.randomUUID().substring(0, 12);
+  }
+  // === OPENAI 兼容结束 ===
+
   try {
     // 检查环境变量是否配置
     if (!AUTH_KEY || GEMINI_API_KEYS.length === 0) {
