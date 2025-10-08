@@ -42,6 +42,64 @@ if (GEMINI_API_KEYS.length > 0) {
 }
 console.log("========================");
 
+// === OPENAI 兼容开始 ===
+// OpenAI 模型到 Gemini 模型的映射
+const OPENAI_TO_GEMINI: Record<string, string> = {
+  "gpt-3.5-turbo": "gemini-pro",
+  "gpt-4": "gemini-1.5-pro",
+  "gemini-pro": "gemini-pro",
+  "gemini-1.5-pro": "gemini-1.5-pro",
+  "gemini-1.5-flash": "gemini-1.5-flash",
+};
+
+// 生成 OpenAI 风格的响应 ID
+function generateOpenAIId(): string {
+  return "chatcmpl-" + crypto.randomUUID().substring(0, 12);
+}
+
+// 将 OpenAI 消息格式转换为 Gemini 格式
+function convertMessagesToGemini(messages: Array<{ role: string; content: string }>) {
+  const contents = [];
+  for (const msg of messages) {
+    contents.push({
+      role: msg.role === "user" ? "user" : "model",
+      parts: [{ text: msg.content }],
+    });
+  }
+  return contents;
+}
+
+// 构建 OpenAI 风格的响应
+function buildOpenAIResponse(
+  content: string,
+  model: string,
+  finishReason = "stop",
+  id: string
+) {
+  return {
+    id,
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model,
+    usage: {
+      prompt_tokens: 0, // 可选：后续可计算
+      completion_tokens: content.length, // 简化估算
+      total_tokens: content.length,
+    },
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: "assistant",
+          content,
+        },
+        finish_reason: finishReason,
+      },
+    ],
+  };
+}
+// === OPENAI 兼容结束 ===
+
 // 处理请求的主函数
 async function handler(req: Request): Promise<Response> {
   const url = new URL(req.url);
@@ -66,21 +124,117 @@ async function handler(req: Request): Promise<Response> {
   }
 
   // === OPENAI 兼容开始 ===
-  // OpenAI 模型到 Gemini 模型的映射
-  const OPENAI_TO_GEMINI: Record<string, string> = {
-    "gpt-3.5-turbo": "gemini-pro",
-    "gpt-4": "gemini-1.5-pro",
-    "gemini-pro": "gemini-pro",
-    "gemini-1.5-pro": "gemini-1.5-pro",
-    "gemini-1.5-flash": "gemini-1.5-flash",
-  };
-  
-  // 生成 OpenAI 风格的响应 ID
-  function generateOpenAIId(): string {
-    return "chatcmpl-" + crypto.randomUUID().substring(0, 12);
+  // 拦截 OpenAI 兼容请求
+  if (url.pathname === "/openai/v1/chat/completions" || url.pathname === "/openai/v1/chat/completion") {
+    if (req.method !== "POST") {
+      return new Response(
+        JSON.stringify({ error: "Method not allowed" }),
+        { 
+          status: 405,
+          headers: { "Content-Type": "application/json" }
+        }
+      );
+    }
+
+    // 1. 验证密钥（使用与 Gemini 相同的 AUTH_KEY）
+    let clientKey = "";
+    const authHeader = req.headers.get("Authorization");
+    if (authHeader?.startsWith("Bearer ")) {
+      clientKey = authHeader.substring(7).trim();
+    } else {
+      clientKey = url.searchParams.get("key") || "";
+    }
+
+    if (!clientKey || clientKey !== AUTH_KEY) {
+      console.log(`[${requestId}] OpenAI 认证失败：无效密钥`);
+      return new Response(
+        JSON.stringify({ error: "Unauthorized: Invalid API key" }),
+        { 
+          status: 401, 
+          headers: { "Content-Type": "application/json" } 
+        }
+      );
+    }
+
+    try {
+      const body = await req.json();
+      const openaiModel = body.model || "gpt-3.5-turbo";
+      const geminiModel = OPENAI_TO_GEMINI[openaiModel] || "gemini-pro";
+      const messages = body.messages || [];
+
+      if (messages.length === 0) {
+        return new Response(
+          JSON.stringify({ error: "No messages provided" }),
+          { status: 400, headers: { "Content-Type": "application/json" } }
+        );
+      }
+
+      // 转换消息
+      const geminiContents = convertMessagesToGemini(messages);
+
+      // 随机选择 Gemini API Key
+      const selectedGeminiKey = getRandomApiKey();
+      const geminiUrl = `${GEMINI_API_BASE}/v1/models/${geminiModel}:generateContent?key=${selectedGeminiKey}`;
+
+      // 构造 Gemini 请求体
+      const geminiRequestBody = {
+        contents: geminiContents,
+        generationConfig: {
+          temperature: body.temperature ?? 0.7,
+          maxOutputTokens: body.max_tokens ?? 2048,
+        },
+      };
+
+      const geminiResponse = await fetch(geminiUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(geminiRequestBody),
+      });
+
+      if (!geminiResponse.ok) {
+        const errorText = await geminiResponse.text();
+        console.error(`[${requestId}] Gemini API 错误:`, errorText);
+        return new Response(
+          JSON.stringify({ error: "Gemini API error", details: errorText }),
+          { status: geminiResponse.status, headers: { "Content-Type": "application/json" } }
+        );
+      }
+
+      const geminiData = await geminiResponse.json();
+      const candidate = geminiData.candidates?.[0];
+      const content = candidate?.content?.parts?.[0]?.text || "No response generated.";
+      const finishReason = candidate?.finishReason || "stop";
+
+      // 构建 OpenAI 格式响应
+      const openAIResponse = buildOpenAIResponse(
+        content,
+        openaiModel,
+        finishReason,
+        generateOpenAIId()
+      );
+
+      console.log(`[${requestId}] OpenAI 响应完成: ${openAIResponse.choices[0].message.content.substring(0, 100)}...`);
+
+      return new Response(JSON.stringify(openAIResponse), {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*",
+          "X-Request-ID": requestId,
+        },
+      });
+
+    } catch (error) {
+      console.error(`[${requestId}] OpenAI 处理错误:`, error);
+      return new Response(
+        JSON.stringify({ error: "Internal error", message: error instanceof Error ? error.message : "Unknown" }),
+        { status: 500, headers: { "Content-Type": "application/json" } }
+      );
+    }
   }
   // === OPENAI 兼容结束 ===
 
+  // === 原有 Gemini 中转逻辑（完全未修改） ===
   try {
     // 检查环境变量是否配置
     if (!AUTH_KEY || GEMINI_API_KEYS.length === 0) {
@@ -300,6 +454,7 @@ async function handler(req: Request): Promise<Response> {
       }
     );
   }
+  // === 原有逻辑结束 ===
 }
 
 console.log("Gemini API 代理服务器已启动...");
